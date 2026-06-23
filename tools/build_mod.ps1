@@ -407,7 +407,7 @@ while ($true) {
         $Utf8NoBom = New-Object System.Text.UTF8Encoding $false
         $AllowedExts = @('.xml', '.css', '.js', '.vsndevts', '.wav', '.vtex', '.vsvg', '.vpcf', '.vmdl', '.vmat')
         $CompileOutputs = @{
-            '.xml'      = '.xml_c'
+            '.xml'      = '.vxml_c'
             '.css'      = '.vcss_c'
             '.js'       = '.vjs_c'
             '.vsndevts' = '.vsndevts_c'
@@ -418,7 +418,7 @@ while ($true) {
             '.vmdl'     = '.vmdl_c'
             '.vmat'     = '.vmat_c'
         }
-        $StaleCompiledExts = @('.xml_c', '.vcss_c', '.vjs_c', '.vsndevts_c', '.vsnd_c', '.vtex_c', '.vsvg_c', '.vpcf_c', '.vmdl_c', '.vmat_c')
+        $StaleCompiledExts = @('.vxml_c', '.vcss_c', '.vjs_c', '.vsndevts_c', '.vsnd_c', '.vtex_c', '.vsvg_c', '.vpcf_c', '.vmdl_c', '.vmat_c')
         
         $updatedCount = 0
         $changedFiles = New-Object System.Collections.Generic.List[string]
