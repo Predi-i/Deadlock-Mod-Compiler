@@ -126,6 +126,80 @@ function Get-CompiledOutputPath($BaseDir, $RelativePath, $CompiledExtension) {
     return Join-Path $BaseDir $compiledPath
 }
 
+# Invokes a native executable safely. Under PowerShell 5.1 with
+# $ErrorActionPreference = 'Stop', any line a native tool writes to stderr (even
+# harmless banners) is promoted to a terminating NativeCommandError, which would
+# abort the build mid-step. We drop to 'Continue' for the call and judge success
+# solely by the process exit code.
+function Invoke-NativeCommand {
+    param(
+        [Parameter(Mandatory = $true)][string]$FilePath,
+        [string[]]$Arguments = @()
+    )
+    $prevEAP = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        $output = & $FilePath @Arguments 2>&1
+        $code = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $prevEAP
+    }
+    return [pscustomobject]@{ Output = $output; ExitCode = $code }
+}
+
+# Resolves Steam / addons / CSDK locations from the current $Config into
+# script-scoped variables. Returns $true only when both the compiler and packer
+# executables exist, so callers can keep the UI reachable instead of hard-exiting
+# (which previously made the in-app "fix CSDK path" Settings flow impossible).
+function Resolve-BuildPaths {
+    $resolvedSteam = $Config.SteamPath
+    if ([string]::IsNullOrWhiteSpace($resolvedSteam) -or -not (Test-Path $resolvedSteam)) {
+        $resolvedSteam = "C:\Program Files (x86)\Steam"
+        try {
+            $RegSteam = Get-ItemPropertyValue -Path "HKLM:\SOFTWARE\WOW6432Node\Valve\Steam" -Name "InstallPath" -ErrorAction Stop
+            if (Test-Path $RegSteam) { $resolvedSteam = $RegSteam }
+        } catch { }
+    }
+    $script:SteamPath = $resolvedSteam
+
+    $PotentialLibs = @($resolvedSteam)
+    $VdfPath = Join-Path $resolvedSteam "steamapps\libraryfolders.vdf"
+    if (Test-Path $VdfPath) {
+        $VdfContent = Get-Content $VdfPath -Raw
+        $VdfMatches = [regex]::Matches($VdfContent, '"path"\s+"([^"]+)"')
+        foreach ($m in $VdfMatches) {
+            $PotentialLibs += $m.Groups[1].Value.Replace("\\", "\")
+        }
+    }
+
+    $resolvedAddons = $null
+    foreach ($lib in $PotentialLibs) {
+        $DeadlockBase = Join-Path $lib "steamapps\common\Deadlock"
+        if (Test-Path $DeadlockBase) {
+            $resolvedAddons = Join-Path $DeadlockBase "game\citadel\addons"
+            if (-not (Test-Path $resolvedAddons)) { New-Item -ItemType Directory -Force -Path $resolvedAddons | Out-Null }
+            break
+        }
+    }
+    if ($null -eq $resolvedAddons) {
+        $resolvedAddons = Join-Path $resolvedSteam "steamapps\common\Deadlock\game\citadel\addons"
+    }
+    $script:AddonsDir = $resolvedAddons
+
+    $resolvedCsdk = $Config.CsdkPath
+    if (-not (Test-Path (Join-Path $resolvedCsdk "game\bin_cs2\win64\resourcecompiler.exe"))) {
+        $NestedRoot = Join-Path $resolvedCsdk "Reduced_CSDK_12"
+        if (Test-Path (Join-Path $NestedRoot "game\bin_cs2\win64\resourcecompiler.exe")) {
+            $resolvedCsdk = $NestedRoot
+        }
+    }
+    $script:CsdkRoot = $resolvedCsdk
+    $script:Compiler = Join-Path $resolvedCsdk "game\bin_cs2\win64\resourcecompiler.exe"
+    $script:Packer   = Join-Path $resolvedCsdk "game\bin\win64\CSDKCfgVPK.exe"
+
+    return ((Test-Path $script:Compiler) -and (Test-Path $script:Packer))
+}
+
 # ==============================================================================
 # CONFIGURATION MANAGEMENT
 # ==============================================================================
@@ -160,53 +234,11 @@ if (-not (Test-Path $ConfigPath)) {
 # ==============================================================================
 # PATH RESOLUTION
 # ==============================================================================
-$SteamPath = $Config.SteamPath
-if ([string]::IsNullOrWhiteSpace($SteamPath) -or -not (Test-Path $SteamPath)) {
-    $SteamPath = "C:\Program Files (x86)\Steam"
-    try {
-        $RegSteam = Get-ItemPropertyValue -Path "HKLM:\SOFTWARE\WOW6432Node\Valve\Steam" -Name "InstallPath" -ErrorAction Stop
-        if (Test-Path $RegSteam) { $SteamPath = $RegSteam }
-    } catch { }
+if (-not (Resolve-BuildPaths)) {
+    Write-Host "WARNING: CSDK compiler/packer not found at '$CsdkRoot'." -ForegroundColor Yellow
+    Write-Host "Open Settings ([0] in the menu) to set a valid CSDK path, or edit data\config.json." -ForegroundColor Yellow
+    Start-Sleep -Seconds 2
 }
-
-$PotentialLibs = @($SteamPath)
-$VdfPath = Join-Path $SteamPath "steamapps\libraryfolders.vdf"
-if (Test-Path $VdfPath) {
-    $VdfContent = Get-Content $VdfPath -Raw
-    $Matches = [regex]::Matches($VdfContent, '"path"\s+"([^"]+)"')
-    foreach ($m in $Matches) {
-        $PotentialLibs += $m.Groups[1].Value.Replace("\\", "\")
-    }
-}
-
-$AddonsDir = $null
-foreach ($lib in $PotentialLibs) {
-    $DeadlockBase = Join-Path $lib "steamapps\common\Deadlock"
-    if (Test-Path $DeadlockBase) {
-        $AddonsDir = Join-Path $DeadlockBase "game\citadel\addons"
-        if (-not (Test-Path $AddonsDir)) { New-Item -ItemType Directory -Force -Path $AddonsDir | Out-Null }
-        break
-    }
-}
-
-if ($null -eq $AddonsDir) {
-    $AddonsDir = Join-Path $SteamPath "steamapps\common\Deadlock\game\citadel\addons"
-}
-
-$CsdkRoot = $Config.CsdkPath
-if (-not (Test-Path (Join-Path $CsdkRoot "game\bin_cs2\win64\resourcecompiler.exe"))) {
-    $NestedRoot = Join-Path $CsdkRoot "Reduced_CSDK_12"
-    if (Test-Path (Join-Path $NestedRoot "game\bin_cs2\win64\resourcecompiler.exe")) {
-        $CsdkRoot = $NestedRoot
-    } else {
-        Write-Host "ERROR: CSDK not found at $CsdkRoot." -ForegroundColor Red
-        Write-Host "Please set the correct path in config.json." -ForegroundColor Yellow
-        Wait-KeyPressAndExit
-    }
-}
-
-$Compiler = Join-Path $CsdkRoot "game\bin_cs2\win64\resourcecompiler.exe"
-$Packer   = Join-Path $CsdkRoot "game\bin\win64\CSDKCfgVPK.exe"
 
 # ==============================================================================
 # MAIN LOOP
@@ -246,6 +278,7 @@ while ($true) {
             switch ($selection.ToUpperInvariant()) {
                 '0' {
                     Show-SettingsMenu -ConfigObject $Config
+                    $null = Resolve-BuildPaths
                     $validSelection = $false
                     Clear-Host
                     Write-Host "Available mods to build:" -ForegroundColor White
@@ -334,6 +367,10 @@ while ($true) {
     $TempGame    = Join-Path $CsdkRoot "game\citadel_addons\build_$SelectedMod"
 
     try {
+        if (-not (Test-Path $Compiler) -or -not (Test-Path $Packer)) {
+            throw "CSDK compiler/packer not found at '$CsdkRoot'. Open Settings ([0]) to set a valid CSDK path."
+        }
+
         if ($Config.ExecutionMode -eq "BuildAndRestart") { Kill-Deadlock }
 
         if ($CleanTemp) {
@@ -358,7 +395,12 @@ while ($true) {
             Write-Host "  Force rebuild enabled for this run." -ForegroundColor Yellow
         }
         
-        $SourceFiles = Get-ChildItem -Path $ModSourcePath -Recurse -File
+        # Skip dot-directories/dotfiles (.git, .claude, .vs, ...) so editor/tooling
+        # metadata never pollutes the cache or gets packed into the mod.
+        $SourceFiles = Get-ChildItem -Path $ModSourcePath -Recurse -File | Where-Object {
+            $rel = $_.FullName.Substring($ModSourcePath.Length + 1)
+            -not (($rel -split '[\\/]') | Where-Object { $_.StartsWith('.') })
+        }
         $CurrentFiles = @{}
         $FilesToCompile = New-Object System.Collections.Generic.List[string]
         
@@ -532,11 +574,11 @@ while ($true) {
                 }
                 $compilerArgs += "-nop4"
 
-                $CompileOutput = & $Compiler @compilerArgs 2>&1
+                $compileResult = Invoke-NativeCommand -FilePath $Compiler -Arguments $compilerArgs
 
-                if ($LASTEXITCODE -ne 0) {
+                if ($compileResult.ExitCode -ne 0) {
                     Write-Host "`n  [!] Error compiling batch $($i + 1)" -ForegroundColor Red
-                    Write-Host "      Details: $CompileOutput" -ForegroundColor DarkRed
+                    Write-Host "      Details: $($compileResult.Output)" -ForegroundColor DarkRed
                     $errorCount += $batchFiles.Count
                 }
             }
@@ -552,10 +594,23 @@ while ($true) {
         Write-Host "Step 3/3: Packing VPK..." -ForegroundColor Cyan
         if (Test-Path $OutputVpk) { Remove-Item -Path $OutputVpk -Force }
 
-        $PackerOutput = & $Packer $TempGame $OutputVpk 2>&1
-        if ($LASTEXITCODE -ne 0) {
-            Write-Host $PackerOutput -ForegroundColor DarkRed
-            throw "VPK Packer failed with exit code $LASTEXITCODE."
+        # A 'pakNN_dir.vpk' is paired with data archives (pakNN_000.vpk, ...).
+        # Remove stale ones first so a smaller rebuild can't leave orphaned data
+        # chunks that still ship removed assets to the game.
+        $vpkDir  = Split-Path $OutputVpk
+        $vpkLeaf = Split-Path $OutputVpk -Leaf
+        if ($vpkLeaf -match '^(.*)_dir\.vpk$') {
+            $vpkBase = $matches[1]
+            $escapedBase = [regex]::Escape($vpkBase)
+            Get-ChildItem -Path $vpkDir -Filter "$vpkBase`_*.vpk" -File -ErrorAction SilentlyContinue |
+                Where-Object { $_.Name -match "^${escapedBase}_\d{3}\.vpk$" } |
+                ForEach-Object { Remove-Item -Path $_.FullName -Force -ErrorAction SilentlyContinue }
+        }
+
+        $packResult = Invoke-NativeCommand -FilePath $Packer -Arguments @($TempGame, $OutputVpk)
+        if ($packResult.ExitCode -ne 0) {
+            Write-Host $packResult.Output -ForegroundColor DarkRed
+            throw "VPK Packer failed with exit code $($packResult.ExitCode)."
         }
 
         Write-Host "`n=== BUILD SUCCESSFUL ===" -ForegroundColor Green
