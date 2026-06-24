@@ -90,6 +90,7 @@ function Show-SettingsMenu {
         Write-Host "[2] Execution mode:    $($ConfigObject.ExecutionMode)"
         Write-Host "[3] Steam path:        $($ConfigObject.SteamPath)"
         Write-Host "[4] CSDK path:         $($ConfigObject.CsdkPath)"
+        Write-Host "[5] Wipe CSDK citadel_addons folders (game + content)" -ForegroundColor Yellow
         Write-Host "[0] Back"
 
         $choice = Read-Host "Select setting"
@@ -109,6 +110,46 @@ function Show-SettingsMenu {
             '4' {
                 $ConfigObject.CsdkPath = Read-Host "Enter CSDK path"
             }
+            '5' {
+                # Fully wipe the CSDK staging trees so the next build starts clean.
+                # Re-resolve from the current config in case the path was just edited.
+                $null = Resolve-BuildPaths
+                $csdk = $script:CsdkRoot
+                $targets = @(
+                    (Join-Path $csdk "content\citadel_addons"),
+                    (Join-Path $csdk "game\citadel_addons")
+                )
+
+                Write-Host "`nThis will permanently delete:" -ForegroundColor Yellow
+                foreach ($t in $targets) { Write-Host "  $t" }
+                $confirm = Read-Host "Type Y to confirm"
+                if ($confirm.Trim().ToUpperInvariant() -eq 'Y') {
+                    foreach ($t in $targets) {
+                        if (Test-Path $t) {
+                            try {
+                                Get-ChildItem -Path $t -Force -ErrorAction Stop | Remove-Item -Recurse -Force -ErrorAction Stop
+                                Write-Host "  Cleared: $t" -ForegroundColor Green
+                            } catch {
+                                Write-Host "  Failed to clear $t : $($_.Exception.Message)" -ForegroundColor Red
+                            }
+                        } else {
+                            Write-Host "  Not found (skipped): $t" -ForegroundColor DarkGray
+                        }
+                    }
+
+                    # The build cache tracks files staged in those trees; invalidate
+                    # it so the next build re-stages everything instead of assuming
+                    # the now-deleted artifacts are still present.
+                    if (Test-Path $CachePath) {
+                        Remove-Item -Path $CachePath -Force -ErrorAction SilentlyContinue
+                        Write-Host "  Build cache reset." -ForegroundColor Green
+                    }
+                } else {
+                    Write-Host "  Cancelled." -ForegroundColor DarkGray
+                }
+                Write-Host "Press any key to continue..." -ForegroundColor Cyan
+                $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
+            }
             '0' {
                 $ConfigObject | ConvertTo-Json -Depth 2 | Set-Content $ConfigPath -Encoding UTF8
                 return
@@ -124,6 +165,38 @@ function Get-CompileKeyForFile($FileInfo) {
 function Get-CompiledOutputPath($BaseDir, $RelativePath, $CompiledExtension) {
     $compiledPath = [System.IO.Path]::ChangeExtension($RelativePath, $CompiledExtension.TrimStart('.'))
     return Join-Path $BaseDir $compiledPath
+}
+
+# Parses a raw menu entry like "6 -Force", "6 f", "6 -f -cleantemp" into the
+# command token plus per-run build flags. Flags are accepted with or without a
+# leading '-'/'/' and in both long and short form (force/f, cleantemp/clean/c),
+# so the same tags that work as launch parameters also work when typed at the
+# interactive prompt.
+function Parse-RunFlags {
+    param([string]$InputText)
+
+    $force = $false
+    $clean = $false
+    $rest  = New-Object System.Collections.Generic.List[string]
+
+    foreach ($tok in ($InputText -split '\s+')) {
+        if ([string]::IsNullOrWhiteSpace($tok)) { continue }
+        $norm = $tok.TrimStart('-', '/').ToLowerInvariant()
+        switch ($norm) {
+            'force'     { $force = $true }
+            'f'         { $force = $true }
+            'cleantemp' { $clean = $true }
+            'clean'     { $clean = $true }
+            'c'         { $clean = $true }
+            default     { $rest.Add($tok) }
+        }
+    }
+
+    return [pscustomobject]@{
+        Force     = $force
+        CleanTemp = $clean
+        Command   = ($rest -join ' ').Trim()
+    }
 }
 
 # Invokes a native executable safely. Under PowerShell 5.1 with
@@ -248,7 +321,7 @@ $InitialMod = $ModFolderName
 while ($true) {
     Clear-Host
     Write-Host "=== Deadlock Mod Compiler (Incremental Build) ===" -ForegroundColor Cyan
-    Write-Host "Tip: use -Force for a full rebuild, -CleanTemp to wipe temporary build folders.`n" -ForegroundColor DarkGray
+    Write-Host "Tip: add flags after the number, e.g. '6 -Force' (-f) for a full rebuild, '-CleanTemp' (-c) to wipe temp folders.`n" -ForegroundColor DarkGray
     
     $SelectedMod = $InitialMod
 
@@ -274,7 +347,15 @@ while ($true) {
 
         $validSelection = $false
         while (-not $validSelection) {
-            $selection = Read-Host "Enter the number of the mod to compile"
+            $rawSelection = Read-Host "Enter the number of the mod to compile"
+
+            # Strip and apply per-run build flags (-Force/-f, -CleanTemp/-clean/-c)
+            # typed alongside the menu choice, e.g. "6 -Force" or "6 f c".
+            $parsedRun = Parse-RunFlags -InputText $rawSelection
+            $Force = $parsedRun.Force
+            $CleanTemp = $parsedRun.CleanTemp
+            $selection = $parsedRun.Command
+
             switch ($selection.ToUpperInvariant()) {
                 '0' {
                     Show-SettingsMenu -ConfigObject $Config
