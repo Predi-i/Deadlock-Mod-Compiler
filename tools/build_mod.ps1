@@ -1,8 +1,7 @@
 [CmdletBinding()]
 param(
     [string]$ModFolderName,
-    [switch]$Force,
-    [switch]$CleanTemp
+    [switch]$Force
 )
 
 [console]::TreatControlCAsInput = $false
@@ -167,16 +166,16 @@ function Get-CompiledOutputPath($BaseDir, $RelativePath, $CompiledExtension) {
     return Join-Path $BaseDir $compiledPath
 }
 
-# Parses a raw menu entry like "6 -Force", "6 f", "6 -f -cleantemp" into the
-# command token plus per-run build flags. Flags are accepted with or without a
-# leading '-'/'/' and in both long and short form (force/f, cleantemp/clean/c),
-# so the same tags that work as launch parameters also work when typed at the
-# interactive prompt.
+# Parses a raw menu entry like "6 -Force", "6 f" or "6 -f" into the command
+# token plus the per-run Force flag. The flag is accepted with or without a
+# leading '-'/'/' and in both long and short form (force/f), so the same tag
+# that works as a launch parameter also works when typed at the interactive
+# prompt. A forced run does a full clean rebuild of the mod (see -Force handling
+# below); for a global wipe of every mod use Settings [5].
 function Parse-RunFlags {
     param([string]$InputText)
 
     $force = $false
-    $clean = $false
     $rest  = New-Object System.Collections.Generic.List[string]
 
     foreach ($tok in ($InputText -split '\s+')) {
@@ -185,17 +184,13 @@ function Parse-RunFlags {
         switch ($norm) {
             'force'     { $force = $true }
             'f'         { $force = $true }
-            'cleantemp' { $clean = $true }
-            'clean'     { $clean = $true }
-            'c'         { $clean = $true }
             default     { $rest.Add($tok) }
         }
     }
 
     return [pscustomobject]@{
-        Force     = $force
-        CleanTemp = $clean
-        Command   = ($rest -join ' ').Trim()
+        Force   = $force
+        Command = ($rest -join ' ').Trim()
     }
 }
 
@@ -321,7 +316,7 @@ $InitialMod = $ModFolderName
 while ($true) {
     Clear-Host
     Write-Host "=== Deadlock Mod Compiler (Incremental Build) ===" -ForegroundColor Cyan
-    Write-Host "Tip: add flags after the number, e.g. '6 -Force' (-f) for a full rebuild, '-CleanTemp' (-c) to wipe temp folders.`n" -ForegroundColor DarkGray
+    Write-Host "Tip: add '-Force' (or '-f') after the number, e.g. '6 -Force', for a full clean rebuild of that mod.`n" -ForegroundColor DarkGray
     
     $SelectedMod = $InitialMod
 
@@ -349,11 +344,10 @@ while ($true) {
         while (-not $validSelection) {
             $rawSelection = Read-Host "Enter the number of the mod to compile"
 
-            # Strip and apply per-run build flags (-Force/-f, -CleanTemp/-clean/-c)
-            # typed alongside the menu choice, e.g. "6 -Force" or "6 f c".
+            # Strip and apply the per-run Force flag (-Force/-f) typed alongside
+            # the menu choice, e.g. "6 -Force" or "6 f".
             $parsedRun = Parse-RunFlags -InputText $rawSelection
             $Force = $parsedRun.Force
-            $CleanTemp = $parsedRun.CleanTemp
             $selection = $parsedRun.Command
 
             switch ($selection.ToUpperInvariant()) {
@@ -454,8 +448,12 @@ while ($true) {
 
         if ($Config.ExecutionMode -eq "BuildAndRestart") { Kill-Deadlock }
 
-        if ($CleanTemp) {
-            Write-Host "Cleaning temp build folders..." -ForegroundColor Yellow
+        # A forced run is a full clean rebuild of this mod: wipe its temp build
+        # folders first so nothing stale survives (orphaned artifacts from a
+        # failed build, renamed extensions, etc.). The hashing pass below then
+        # re-stages and recompiles every source file from scratch.
+        if ($Force) {
+            Write-Host "Cleaning temp build folders for this mod..." -ForegroundColor Yellow
             if (Test-Path $TempContent) { Remove-Item -Path $TempContent -Recurse -Force }
             if (Test-Path $TempGame) { Remove-Item -Path $TempGame -Recurse -Force }
         }
