@@ -110,8 +110,6 @@ function Show-SettingsMenu {
                 $ConfigObject.CsdkPath = Read-Host "Enter CSDK path"
             }
             '5' {
-                # Fully wipe the CSDK staging trees so the next build starts clean.
-                # Re-resolve from the current config in case the path was just edited.
                 $null = Resolve-BuildPaths
                 $csdk = $script:CsdkRoot
                 $targets = @(
@@ -136,9 +134,6 @@ function Show-SettingsMenu {
                         }
                     }
 
-                    # The build cache tracks files staged in those trees; invalidate
-                    # it so the next build re-stages everything instead of assuming
-                    # the now-deleted artifacts are still present.
                     if (Test-Path $CachePath) {
                         Remove-Item -Path $CachePath -Force -ErrorAction SilentlyContinue
                         Write-Host "  Build cache reset." -ForegroundColor Green
@@ -400,8 +395,6 @@ while ($true) {
         while (-not $validSelection) {
             $rawSelection = Read-Host "Enter the number of the mod to compile"
 
-            # Strip and apply the per-run Force flag (-Force/-f) typed alongside
-            # the menu choice, e.g. "6 -Force" or "6 f".
             $parsedRun = Parse-RunFlags -InputText $rawSelection
             $Force = $parsedRun.Force
             $selection = $parsedRun.Command
@@ -504,10 +497,6 @@ while ($true) {
 
         if ($Config.ExecutionMode -eq "BuildAndRestart") { Kill-Deadlock }
 
-        # A forced run is a full clean rebuild of this mod: wipe its temp build
-        # folders first so nothing stale survives (orphaned artifacts from a
-        # failed build, renamed extensions, etc.). The hashing pass below then
-        # re-stages and recompiles every source file from scratch.
         if ($Force) {
             Write-Host "Cleaning temp build folders for this mod..." -ForegroundColor Yellow
             if (Test-Path $TempContent) { Remove-Item -Path $TempContent -Recurse -Force }
@@ -530,8 +519,6 @@ while ($true) {
             Write-Host "  Force rebuild enabled for this run." -ForegroundColor Yellow
         }
         
-        # Skip dot-directories/dotfiles (.git, .claude, .vs, ...) so editor/tooling
-        # metadata never pollutes the cache or gets packed into the mod.
         $SourceFiles = Get-ChildItem -Path $ModSourcePath -Recurse -File | Where-Object {
             $rel = $_.FullName.Substring($ModSourcePath.Length + 1)
             -not (($rel -split '[\\/]') | Where-Object { $_.StartsWith('.') })
@@ -555,8 +542,6 @@ while ($true) {
             '.png'      = '.vtex_c'
             '.tga'      = '.vtex_c'
         }
-        # Extensions that only exist to be auto-wrapped into a generated .vtex
-        # (see the auto-vtex block below) rather than compiled directly.
         $AutoVtexSourceExts = @('.png', '.tga')
         $StaleCompiledExts = @('.vxml_c', '.vcss_c', '.vjs_c', '.vsndevts_c', '.vsnd_c', '.vtex_c', '.vsvg_c', '.vpcf_c', '.vmdl_c', '.vmat_c')
         
@@ -584,17 +569,12 @@ while ($true) {
             $contentMissing = -not (Test-Path $contentDest)
             $compiledMissing = $compiledDest -and -not (Test-Path $compiledDest)
 
-            # For a bare .png/.tga there are two DIFFERENT compiled artifacts that
-            # something in the mod might be asking for (see the auto-vtex block
-            # below), so "is this file fully built" has to check both of them, not
-            # just the single $compiledDest path computed above.
             if ($AutoVtexSourceExts -contains $file.Extension) {
                 $extNoDot = $file.Extension.TrimStart('.').ToLowerInvariant()
                 $relDir = Split-Path $relPath
                 $relBase = [System.IO.Path]::GetFileNameWithoutExtension($relPath)
                 $bareCompiled = Join-Path $TempGame (Join-Path $relDir "$relBase.vtex_c")
-                $implicitCompiled = Join-Path $TempGame (Join-Path $relDir "${relBase}_$extNoDot.vtex_c")
-                $compiledMissing = (-not (Test-Path $bareCompiled)) -or (-not (Test-Path $implicitCompiled))
+                $compiledMissing = (-not (Test-Path $bareCompiled))
             }
 
             $needsCopy = $hashChanged -or $contentMissing
@@ -619,27 +599,6 @@ while ($true) {
                 $FilesToCompile.Add($contentDest)
             }
 
-            # Bare .png/.tga (no matching hand-authored .vtex next to it) get a
-            # minimal .vtex descriptor generated straight into the staging tree,
-            # so modders never have to touch vtex files themselves — dropping an
-            # image in is enough. If they DO ship their own <name>.vtex, it's
-            # picked up by the normal '.vtex' handling above and this is skipped.
-            #
-            # There are TWO naming conventions in use across the mod for how a
-            # bare image gets referenced, and both need a compiled artifact:
-            #   - CSS image-source/background-image urls point straight at the
-            #     .png and the engine compiles it to the SAME base name, e.g.
-            #     "border.png" -> "border.vtex_c".
-            #   - JS-side image assignments (e.g. the credits list iconSrc
-            #     entries, header logos) use Source 2's implicit-conversion
-            #     naming instead: basename + "_" + source extension, e.g.
-            #     "border.png" -> "border_png.vtex" -> "border_png.vtex_c".
-            # Generating only the first one is what silently broke every
-            # bare-png reference that used the second style (flags, logos) -
-            # ResourceSystem reported "border_png.vtex_c: File not found" even
-            # though "border.vtex_c" compiled fine. Generate both so a dropped-in
-            # image works regardless of which style references it, unless the
-            # modder shipped their own hand-authored .vtex under either name.
             if ($AutoVtexSourceExts -contains $file.Extension -and ($needsCopy -or $needsCompile)) {
                 $relFileName = $relPath -replace '\\', '/'
                 $vtexBody = Get-AutoVtexBody -RelFileName $relFileName
@@ -655,23 +614,8 @@ while ($true) {
                     [System.IO.File]::WriteAllText($genBareVtexPath, $vtexBody, $Utf8NoBom)
                     $FilesToCompile.Add($genBareVtexPath)
 
-                    # Mark it "current" so the orphan-cleanup pass below (which runs
-                    # before compilation) doesn't delete it — it has no 1:1 source
-                    # file of its own, it's derived from the .png above.
                     $genBareRelPath = $genBareVtexPath.Substring($TempContent.Length + 1)
                     $CurrentFiles["${SelectedMod}|${genBareRelPath}".ToLower()] = $true
-                }
-
-                $implicitVtexSourcePath = Join-Path (Split-Path $file.FullName) "$([System.IO.Path]::GetFileNameWithoutExtension($file.FullName))_$extNoDot.vtex"
-                if (Test-Path $implicitVtexSourcePath) {
-                    Write-Host "  Skipping implicit auto-vtex for $relPath (custom _$extNoDot.vtex present)" -ForegroundColor DarkGray
-                } else {
-                    $genImplicitVtexPath = Join-Path $contentDir "${contentBase}_$extNoDot.vtex"
-                    [System.IO.File]::WriteAllText($genImplicitVtexPath, $vtexBody, $Utf8NoBom)
-                    $FilesToCompile.Add($genImplicitVtexPath)
-
-                    $genImplicitRelPath = $genImplicitVtexPath.Substring($TempContent.Length + 1)
-                    $CurrentFiles["${SelectedMod}|${genImplicitRelPath}".ToLower()] = $true
                 }
             }
 
@@ -804,9 +748,6 @@ while ($true) {
         Write-Host "Step 3/3: Packing VPK..." -ForegroundColor Cyan
         if (Test-Path $OutputVpk) { Remove-Item -Path $OutputVpk -Force }
 
-        # A 'pakNN_dir.vpk' is paired with data archives (pakNN_000.vpk, ...).
-        # Remove stale ones first so a smaller rebuild can't leave orphaned data
-        # chunks that still ship removed assets to the game.
         $vpkDir  = Split-Path $OutputVpk
         $vpkLeaf = Split-Path $OutputVpk -Leaf
         if ($vpkLeaf -match '^(.*)_dir\.vpk$') {
