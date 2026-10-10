@@ -12,6 +12,10 @@ If you are tired of manually running csdk compiling your files, tracking changed
 * **Batch Processing:** Automatically splits compilation tasks into batches of 25. This prevents Windows character limit crashes when building massive UI or model replacements.
 * **Auto-Routing:** Automatically detects your Steam installation, Deadlock directory, and `addons` folder.
 * **Safe Vtex Compilation:** Automatically strips unsupported algorithm parameters from `.vtex` files on-the-fly to prevent compiler crashes.
+* **Texture Refresh:** Changed or removed PNG/TGA inputs requeue texture descriptors, including custom `.vtex` files. CSDK resolves their dependencies.
+* **Direct Resources:** TTF fonts and supported already-compiled resources are copied without compilation. Unsupported files are listed instead of silently omitted.
+* **Safe Output Replacement:** Packing happens in a temporary directory. The previous VPK bundle is backed up before replacement and restored if replacement fails.
+* **Addon Slots:** Uses the first available slot from `pak01` to `pak99`, ignoring stale registry entries. Orphaned numbered data archives also reserve their slot.
 
 ## ⚙️ Prerequisites
 
@@ -47,6 +51,39 @@ Enter the number of the mod to compile: 6 -Force
 
 This wipes that mod's temporary build folders and recompiles every file from
 scratch. The flag also works as a launch parameter (`build_mod.ps1 -Force`).
+GNU-style `--force` and `--f` are also accepted. Launch flags remain active when
+you select a mod from the menu.
+
+### Single-mod folder
+
+For a standalone mod, place the contents of `tools` in its `build_mod` directory.
+Keep `build_mod_helpers.ps1` beside `build_mod.ps1`. The builder selects the parent
+mod automatically; its local output is saved in `build_mod/builds`.
+
+### Batch mode
+
+Automation can select an explicit source and destination without menus:
+
+```powershell
+.\tools\build_mod.ps1 -ModFolderName Example -Batch -Force -SourcePath C:\Mods\Example -OutputPath C:\Builds\Example.vpk
+```
+
+Batch mode uses the configured CSDK path but does not discover game addons,
+install into the game or restart Deadlock. A failed compile stops before packing.
+If replacement and rollback both fail, the error identifies the preserved backup
+directory for recovery. Replacement is not crash-atomic across split VPK files.
+Texture descriptors are revisited for image changes; the tool does not implement
+a general dependency graph for every Source 2 resource type.
+
+### Offline regression checks
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File tools/tests/build_mod_regression.ps1
+```
+
+These checks parse the builder and exercise isolated logic with in-memory file
+operations. They do not run the builder, compiler or packer, create VPK files,
+touch game addons or prove client rendering.
 
 ## 🔧 Configuration
 

@@ -1,15 +1,55 @@
-[CmdletBinding()]
+[CmdletBinding(PositionalBinding = $false)]
 param(
+    [Parameter(Position = 0)]
     [string]$ModFolderName,
-    [switch]$Force
+    [switch]$Force,
+    [switch]$Batch,
+    [string]$SourcePath,
+    [string]$OutputPath,
+    [Parameter(Position = 1, ValueFromRemainingArguments = $true)]
+    [string[]]$RemainingArguments
 )
 
-[console]::TreatControlCAsInput = $false
+# Normalize GNU-style force flags before validating batch arguments.
+if ($ModFolderName -match '^--(?:force|f)$') {
+    $Force = $true
+    $ModFolderName = $null
+}
+foreach ($argument in $RemainingArguments) {
+    if ($argument -match '^--(?:force|f)$') {
+        $Force = $true
+    } elseif (-not [string]::IsNullOrWhiteSpace($argument)) {
+        throw "Unknown build argument: $argument"
+    }
+}
+$LaunchForce = $Force
+
+if (-not $Batch) { [console]::TreatControlCAsInput = $false }
 $ErrorActionPreference = "Stop"
-$Host.UI.RawUI.WindowTitle = "Deadlock Mod Compiler"
+if ($Batch -and ([string]::IsNullOrWhiteSpace($ModFolderName) -or [string]::IsNullOrWhiteSpace($OutputPath))) {
+    throw "-Batch requires -ModFolderName and -OutputPath."
+}
+if ($Batch -and $ModFolderName -notmatch '^[A-Za-z0-9][A-Za-z0-9_-]*$') {
+    throw "Invalid batch build name: $ModFolderName"
+}
+if (-not $Batch -and ($SourcePath -or $OutputPath)) {
+    throw "-SourcePath and -OutputPath require -Batch."
+}
+if (-not $Batch) { $Host.UI.RawUI.WindowTitle = "Deadlock Mod Compiler" }
 
 $ScriptDir = (Resolve-Path "$PSScriptRoot").Path
 $RepoRoot = (Resolve-Path "$ScriptDir\..").Path
+. (Join-Path $ScriptDir 'build_mod_helpers.ps1')
+
+# A build_mod folder inside a mod builds its parent instead of showing a picker.
+# Batch mode retains its explicit source and output paths.
+$SelfBuildMode = -not $Batch -and (Split-Path $ScriptDir -Leaf) -ieq 'build_mod'
+$ForcedMod = $null
+if ($SelfBuildMode) {
+    $ModRoot = Split-Path $ScriptDir -Parent
+    $RepoRoot = Split-Path $ModRoot -Parent
+    $ForcedMod = Split-Path $ModRoot -Leaf
+}
 
 $DataDir = Join-Path $ScriptDir "data"
 if (-not (Test-Path $DataDir)) { New-Item -ItemType Directory -Force -Path $DataDir | Out-Null }
@@ -42,26 +82,6 @@ function Get-ModRegistry {
 
 function Save-ModRegistry ($RegistryMap) {
     $RegistryMap | ConvertTo-Json -Depth 2 | Set-Content $RegistryPath -Encoding UTF8
-}
-
-function Get-NextPakName ($TargetDir, $RegistryMap) {
-    $maxNum = 0
-    $existingPaks = Get-ChildItem -Path $TargetDir -Filter "pak*_dir.vpk" -File -ErrorAction SilentlyContinue
-    foreach ($pak in $existingPaks) {
-        if ($pak.Name -match "^pak(\d+)_dir\.vpk$") {
-            $num = [int]$matches[1]
-            if ($num -gt $maxNum) { $maxNum = $num }
-        }
-    }
-    if ($RegistryMap -and $RegistryMap.Count -gt 0) {
-        foreach ($val in $RegistryMap.Values) {
-            if ($val -match "^pak(\d+)_dir\.vpk$") {
-                $num = [int]$matches[1]
-                if ($num -gt $maxNum) { $maxNum = $num }
-            }
-        }
-    }
-    return "pak{0:D2}_dir.vpk" -f ($maxNum + 1)
 }
 
 function Kill-Deadlock {
@@ -271,6 +291,17 @@ function Invoke-NativeCommand {
 # executables exist, so callers can keep the UI reachable instead of hard-exiting
 # (which previously made the in-app "fix CSDK path" Settings flow impossible).
 function Resolve-BuildPaths {
+    # Release automation only needs the CSDK. Do not discover or create game addons.
+    if ($Batch) {
+        $resolvedCsdk = $Config.CsdkPath
+        if (-not (Test-Path (Join-Path $resolvedCsdk "game\bin_cs2\win64\resourcecompiler.exe"))) {
+            $resolvedCsdk = Join-Path $resolvedCsdk "Reduced_CSDK_12"
+        }
+        $script:CsdkRoot = $resolvedCsdk
+        $script:Compiler = Join-Path $resolvedCsdk "game\bin_cs2\win64\resourcecompiler.exe"
+        $script:Packer = Join-Path $resolvedCsdk "game\bin\win64\CSDKCfgVPK.exe"
+        return ((Test-Path $script:Compiler) -and (Test-Path $script:Packer))
+    }
     $resolvedSteam = $Config.SteamPath
     if ([string]::IsNullOrWhiteSpace($resolvedSteam) -or -not (Test-Path $resolvedSteam)) {
         $resolvedSteam = "C:\Program Files (x86)\Steam"
@@ -296,7 +327,6 @@ function Resolve-BuildPaths {
         $DeadlockBase = Join-Path $lib "steamapps\common\Deadlock"
         if (Test-Path $DeadlockBase) {
             $resolvedAddons = Join-Path $DeadlockBase "game\citadel\addons"
-            if (-not (Test-Path $resolvedAddons)) { New-Item -ItemType Directory -Force -Path $resolvedAddons | Out-Null }
             break
         }
     }
@@ -329,7 +359,15 @@ $DefaultConfig = [ordered]@{
     CsdkPath         = "C:\Reduced_CSDK_12"
 }
 
-if (-not (Test-Path $ConfigPath)) {
+if ($Batch) {
+    $Config = [pscustomobject]$DefaultConfig
+    if (Test-Path $ConfigPath) {
+        $savedConfig = Get-Content -LiteralPath $ConfigPath -Raw | ConvertFrom-Json
+        if ($savedConfig.CsdkPath) { $Config.CsdkPath = $savedConfig.CsdkPath }
+    }
+    $Config.BuildDestination = "Builds"
+    $Config.ExecutionMode = "BuildOnly"
+} elseif (-not (Test-Path $ConfigPath)) {
     $DefaultConfig | ConvertTo-Json -Depth 2 | Set-Content $ConfigPath -Encoding UTF8
     $Config = $DefaultConfig
     Write-Host "Created default config.json" -ForegroundColor DarkGray
@@ -354,6 +392,7 @@ if (-not (Test-Path $ConfigPath)) {
 # PATH RESOLUTION
 # ==============================================================================
 if (-not (Resolve-BuildPaths)) {
+    if ($Batch) { throw "CSDK compiler/packer not found at '$CsdkRoot'. Configure the existing builder first." }
     Write-Host "WARNING: CSDK compiler/packer not found at '$CsdkRoot'." -ForegroundColor Yellow
     Write-Host "Open Settings ([0] in the menu) to set a valid CSDK path, or edit data\config.json." -ForegroundColor Yellow
     Start-Sleep -Seconds 2
@@ -365,13 +404,19 @@ if (-not (Resolve-BuildPaths)) {
 $InitialMod = $ModFolderName
 
 while ($true) {
-    Clear-Host
+    $Force = $LaunchForce
+    if (-not $Batch) { Clear-Host }
     Write-Host "=== Deadlock Mod Compiler (Incremental Build) ===" -ForegroundColor Cyan
     Write-Host "Tip: add '-Force' (or '-f') after the number, e.g. '6 -Force', for a full clean rebuild of that mod.`n" -ForegroundColor DarkGray
     
     $SelectedMod = $InitialMod
 
-    if ([string]::IsNullOrWhiteSpace($SelectedMod)) {
+    if ($SelfBuildMode) {
+        $SelectedMod = $ForcedMod
+        Write-Host "Self-build mode: compiling '$SelectedMod'.`n" -ForegroundColor White
+    }
+
+    if (-not $SelfBuildMode -and [string]::IsNullOrWhiteSpace($SelectedMod)) {
         Write-Host "Available mods to build:" -ForegroundColor White
         
         $folders = Get-ChildItem -Path $RepoRoot -Directory | Where-Object { 
@@ -396,7 +441,7 @@ while ($true) {
             $rawSelection = Read-Host "Enter the number of the mod to compile"
 
             $parsedRun = Parse-RunFlags -InputText $rawSelection
-            $Force = $parsedRun.Force
+            $Force = $LaunchForce -or $parsedRun.Force
             $selection = $parsedRun.Command
 
             switch ($selection.ToUpperInvariant()) {
@@ -438,8 +483,10 @@ while ($true) {
 
     $InitialMod = $null
     $ModSourcePath = Join-Path $RepoRoot $SelectedMod
+    if ($Batch -and $SourcePath) { $ModSourcePath = (Resolve-Path -LiteralPath $SourcePath).Path }
 
     if (-not (Test-Path $ModSourcePath)) {
+        if ($Batch) { throw "Mod source folder not found: $ModSourcePath" }
         Write-Host "ERROR: Mod folder '$SelectedMod' not found." -ForegroundColor Red
         Wait-KeyPressAndExit
     }
@@ -452,32 +499,62 @@ while ($true) {
         elseif ($Config.BuildDestination -eq "Addons") { $BuildMode = 2 } 
         else {
             Write-Host "`nSelect build destination:" -ForegroundColor Cyan
-            Write-Host "[1] Local (/tools/builds/$SelectedMod.vpk)"
+            Write-Host "[1] Local ($(Split-Path $ScriptDir -Leaf)/builds/$SelectedMod.vpk)"
             Write-Host "[2] Game Addons Folder ($AddonsDir)"
+            Write-Host "[0] Settings"
+            Write-Host "[S] Start Deadlock"
+            Write-Host "[R] Restart Deadlock"
             while ($BuildMode -notin @(1, 2)) {
-                $modeSelection = Read-Host "Enter 1 or 2"
-                if ([int]::TryParse($modeSelection, [ref]$null)) { $BuildMode = [int]$modeSelection }
+                $parsedRun = Parse-RunFlags -InputText (Read-Host "Enter 1, 2, 0, S, or R")
+                $selection = $parsedRun.Command.ToUpperInvariant()
+                switch ($selection) {
+                    '0' {
+                        Show-SettingsMenu -ConfigObject $Config
+                        $null = Resolve-BuildPaths
+                    }
+                    'S' { Start-Deadlock }
+                    'R' {
+                        Kill-Deadlock
+                        Start-Deadlock
+                    }
+                    '1' {
+                        $Force = $Force -or $parsedRun.Force
+                        $BuildMode = 1
+                    }
+                    '2' {
+                        $Force = $Force -or $parsedRun.Force
+                        $BuildMode = 2
+                    }
+                }
             }
         }
     }
 
     $OutputVpk = ""
-    if ($BuildMode -eq 1) {
+    if ($Batch) {
+        $OutputVpk = [System.IO.Path]::GetFullPath($OutputPath)
+        $outputDirectory = Split-Path $OutputVpk
+        if (-not (Test-Path -LiteralPath $outputDirectory)) {
+            New-Item -ItemType Directory -Path $outputDirectory -Force | Out-Null
+        }
+    } elseif ($BuildMode -eq 1) {
         if (Test-Path $BuildsDir -PathType Leaf) { Remove-Item $BuildsDir -Force }
         if (-not (Test-Path $BuildsDir)) { New-Item -ItemType Directory -Force -Path $BuildsDir | Out-Null }
         $OutputVpk = Join-Path $BuildsDir "$SelectedMod.vpk"
     } else {
         if (-not (Test-Path $AddonsDir)) {
-            Write-Host "ERROR: Addons directory not found: $AddonsDir" -ForegroundColor Red
-            $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
-            continue
+            $gameDir = Split-Path $AddonsDir
+            if (-not (Test-Path -LiteralPath $gameDir -PathType Container)) {
+                throw "Deadlock game directory not found: $gameDir"
+            }
+            New-Item -ItemType Directory -Force -Path $AddonsDir | Out-Null
         }
         $Registry = Get-ModRegistry
         $AssignedPak = $Registry[$SelectedMod]
-        if ($AssignedPak -and (Test-Path (Join-Path $AddonsDir $AssignedPak))) {
+        if ($AssignedPak -match '^pak(?:0[1-9]|[1-9][0-9])_dir\.vpk$' -and (Test-Path -LiteralPath (Join-Path $AddonsDir $AssignedPak))) {
             $OutputVpk = Join-Path $AddonsDir $AssignedPak
         } else {
-            $AssignedPak = Get-NextPakName -TargetDir $AddonsDir -RegistryMap $Registry
+            $AssignedPak = Get-NextPakName -TargetDir $AddonsDir
             $Registry[$SelectedMod] = $AssignedPak
             Save-ModRegistry -RegistryMap $Registry
             $OutputVpk = Join-Path $AddonsDir $AssignedPak
@@ -489,6 +566,9 @@ while ($true) {
 
     $TempContent = Join-Path $CsdkRoot "content\citadel_addons\build_$SelectedMod"
     $TempGame    = Join-Path $CsdkRoot "game\citadel_addons\build_$SelectedMod"
+    foreach ($entry in @(@($TempContent, "content"), @($TempGame, "game"))) {
+        Assert-BuildChildPath -Path $entry[0] -Parent (Join-Path $CsdkRoot "$($entry[1])\citadel_addons")
+    }
 
     try {
         if (-not (Test-Path $Compiler) -or -not (Test-Path $Packer)) {
@@ -538,7 +618,7 @@ while ($true) {
         $FilesToCompile = New-Object System.Collections.Generic.List[string]
         
         $Utf8NoBom = New-Object System.Text.UTF8Encoding $false
-        $AllowedExts = @('.xml', '.css', '.js', '.vsndevts', '.wav', '.vtex', '.vsvg', '.vpcf', '.vmdl', '.vmat')
+        $AllowedExts = @('.xml', '.css', '.js', '.vsndevts', '.wav', '.vtex', '.vdata', '.vsvg', '.svg', '.vpcf', '.vmdl', '.vmat')
         $CompileOutputs = @{
             '.xml'      = '.vxml_c'
             '.css'      = '.vcss_c'
@@ -546,7 +626,9 @@ while ($true) {
             '.vsndevts' = '.vsndevts_c'
             '.wav'      = '.vsnd_c'
             '.vtex'     = '.vtex_c'
+            '.vdata'    = '.vdata_c'
             '.vsvg'     = '.vsvg_c'
+            '.svg'      = '.vsvg_c'
             '.vpcf'     = '.vpcf_c'
             '.vmdl'     = '.vmdl_c'
             '.vmat'     = '.vmat_c'
@@ -554,13 +636,20 @@ while ($true) {
             '.tga'      = '.vtex_c'
         }
         $AutoVtexSourceExts = @('.png', '.tga')
-        $StaleCompiledExts = @('.vxml_c', '.vcss_c', '.vjs_c', '.vsndevts_c', '.vsnd_c', '.vtex_c', '.vsvg_c', '.vpcf_c', '.vmdl_c', '.vmat_c')
+        $StaleCompiledExts = @('.vxml_c', '.vcss_c', '.vjs_c', '.vsndevts_c', '.vsnd_c', '.vtex_c', '.vdata_c', '.vsvg_c', '.vpcf_c', '.vmdl_c', '.vmat_c')
+        $DirectExts = @('.ttf') + $StaleCompiledExts
+        $imagesChanged = $false
+        $unsupportedFiles = New-Object System.Collections.Generic.List[string]
         
         $updatedCount = 0
         $changedFiles = New-Object System.Collections.Generic.List[string]
 
         foreach ($file in $SourceFiles) {
             $relPath = $file.FullName.Substring($ModSourcePath.Length + 1)
+            if ($file.Extension -notin ($AllowedExts + $AutoVtexSourceExts + $DirectExts)) {
+                $unsupportedFiles.Add($relPath)
+                continue
+            }
             $cacheKey = "${SelectedMod}|${relPath}".ToLower()
             $CurrentFiles[$cacheKey] = $true
 
@@ -577,6 +666,7 @@ while ($true) {
             }
 
             $hashChanged = $Force -or $null -eq $cachedCompileKey -or $cachedCompileKey.Trim() -ne $compileKey
+            if ($AutoVtexSourceExts -contains $file.Extension -and $hashChanged) { $imagesChanged = $true }
             $contentMissing = -not (Test-Path $contentDest)
             $compiledMissing = $compiledDest -and -not (Test-Path $compiledDest)
 
@@ -607,6 +697,15 @@ while ($true) {
 
             if ($AllowedExts -contains $file.Extension -and ($needsCopy -or $needsCompile)) {
                 $FilesToCompile.Add($contentDest)
+            }
+            # These resources are consumed directly rather than compiled.
+            if ($DirectExts -contains $file.Extension) {
+                $rawDest = Join-Path $TempGame $relPath
+                if ($hashChanged -or -not (Test-Path -LiteralPath $rawDest)) {
+                    $rawDir = Split-Path $rawDest
+                    if (-not (Test-Path -LiteralPath $rawDir)) { New-Item -ItemType Directory -Path $rawDir -Force | Out-Null }
+                    Copy-Item -LiteralPath $file.FullName -Destination $rawDest -Force
+                }
             }
 
             if ($AutoVtexSourceExts -contains $file.Extension) {
@@ -650,6 +749,7 @@ while ($true) {
                 if (-not $CurrentFiles.Contains($key)) {
                     $KeysToRemove.Add($key)
                     $relPath = $key.Substring($prefix.Length)
+                    if ([IO.Path]::GetExtension($relPath) -in $AutoVtexSourceExts) { $imagesChanged = $true }
                     
                     $cPath = Join-Path $TempContent $relPath
                     if (Test-Path $cPath) { Remove-Item $cPath -Recurse -Force }
@@ -709,6 +809,19 @@ while ($true) {
             }
         }
 
+        # CSDK resolves descriptor dependencies. Revisit every texture descriptor
+        # when an image changes, including custom descriptors with other filenames.
+        if ($imagesChanged) {
+            foreach ($descriptor in (Get-ChildItem -LiteralPath $TempContent -Recurse -Filter '*.vtex' -File)) {
+                if (-not $FilesToCompile.Contains($descriptor.FullName)) {
+                    $FilesToCompile.Add($descriptor.FullName)
+                }
+            }
+        }
+        if ($unsupportedFiles.Count -gt 0) {
+            Write-Warning ("Unsupported files excluded from the build:`n" + ($unsupportedFiles -join "`n"))
+        }
+
         Write-Host "  Found $updatedCount new/modified files. Removed $($KeysToRemove.Count) deleted files." -ForegroundColor DarkGray
 
         if ($changedFiles.Count -gt 0) {
@@ -717,12 +830,6 @@ while ($true) {
                 Write-Host "    - $changedFile" -ForegroundColor DarkGray
             }
         }
-
-        $CacheObj = New-Object PSObject
-        foreach ($key in $BuildCache.Keys) {
-            $CacheObj | Add-Member -MemberType NoteProperty -Name $key -Value $BuildCache[$key]
-        }
-        $CacheObj | ConvertTo-Json -Depth 1 | Set-Content $CachePath -Encoding UTF8
 
         Write-Host "Step 2/3: Compiling assets..." -ForegroundColor Cyan
         $errorCount = 0
@@ -759,26 +866,35 @@ while ($true) {
         }
 
         if ($errorCount -gt 0) {
-            Write-Host "WARNING: $errorCount files failed to compile. VPK might be incomplete." -ForegroundColor Red
+            throw "$errorCount files failed to compile. Aborting before VPK packing."
         }
+
+        # Only persist the incremental-build cache after every changed source
+        # compiled successfully. Otherwise a failed source could be skipped by
+        # the next build merely because its timestamp was already cached.
+        $CacheObj = New-Object PSObject
+        foreach ($key in $BuildCache.Keys) {
+            $CacheObj | Add-Member -MemberType NoteProperty -Name $key -Value $BuildCache[$key]
+        }
+        $CacheObj | ConvertTo-Json -Depth 1 | Set-Content $CachePath -Encoding UTF8
 
         Write-Host "Step 3/3: Packing VPK..." -ForegroundColor Cyan
-        if (Test-Path $OutputVpk) { Remove-Item -Path $OutputVpk -Force }
-
-        $vpkDir  = Split-Path $OutputVpk
-        $vpkLeaf = Split-Path $OutputVpk -Leaf
-        if ($vpkLeaf -match '^(.*)_dir\.vpk$') {
-            $vpkBase = $matches[1]
-            $escapedBase = [regex]::Escape($vpkBase)
-            Get-ChildItem -Path $vpkDir -Filter "$vpkBase`_*.vpk" -File -ErrorAction SilentlyContinue |
-                Where-Object { $_.Name -match "^${escapedBase}_\d{3}\.vpk$" } |
-                ForEach-Object { Remove-Item -Path $_.FullName -Force -ErrorAction SilentlyContinue }
-        }
-
-        $packResult = Invoke-NativeCommand -FilePath $Packer -Arguments @($TempGame, $OutputVpk)
-        if ($packResult.ExitCode -ne 0) {
-            Write-Host $packResult.Output -ForegroundColor DarkRed
-            throw "VPK Packer failed with exit code $($packResult.ExitCode)."
+        $packStage = Join-Path (Split-Path $OutputVpk) ('.build-' + [guid]::NewGuid().ToString('N'))
+        Assert-BuildChildPath -Path $packStage -Parent (Split-Path $OutputVpk)
+        New-Item -ItemType Directory -Path $packStage -ErrorAction Stop | Out-Null
+        try {
+            $stagedOutput = Join-Path $packStage (Split-Path $OutputVpk -Leaf)
+            $packResult = Invoke-NativeCommand -FilePath $Packer -Arguments @($TempGame, $stagedOutput)
+            if ($packResult.ExitCode -ne 0) {
+                Write-Host $packResult.Output -ForegroundColor DarkRed
+                throw "VPK Packer failed with exit code $($packResult.ExitCode)."
+            }
+            Publish-VpkBundle -Staging $packStage -Output $OutputVpk
+        } finally {
+            # A failed rollback keeps its backup available for manual recovery.
+            if (-not (Test-Path -LiteralPath (Join-Path $packStage 'previous'))) {
+                Remove-Item -LiteralPath $packStage -Recurse -Force -ErrorAction Stop
+            }
         }
 
         Write-Host "`n=== BUILD SUCCESSFUL ===" -ForegroundColor Green
@@ -789,11 +905,17 @@ while ($true) {
     catch {
         Write-Host "`n=== BUILD FAILED ===" -ForegroundColor Red
         Write-Host $_.Exception.Message -ForegroundColor Red
+        # A caller such as build_mod_strip_comments.ps1 must receive a failing
+        # exit status instead of treating the printed error as a successful build.
+        if (-not [string]::IsNullOrWhiteSpace($ModFolderName)) {
+            throw
+        }
     }
     finally {
         Start-Sleep -Milliseconds 500 
     }
 
+    if ($Batch) { break }
     Write-Host "`nPress ANY KEY to return to the main menu, or ESC to exit..." -ForegroundColor Cyan
     $key = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
     if ($key.VirtualKeyCode -eq 27) { break }
