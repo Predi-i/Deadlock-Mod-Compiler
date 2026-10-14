@@ -13,6 +13,7 @@ If you are tired of manually running csdk compiling your files, tracking changed
 * **Auto-Routing:** Automatically detects your Steam installation, Deadlock directory, and `addons` folder.
 * **Safe Vtex Compilation:** Automatically strips unsupported algorithm parameters from `.vtex` files on-the-fly to prevent compiler crashes.
 * **Texture Refresh:** Changed or removed PNG/TGA inputs requeue texture descriptors, including custom `.vtex` files. CSDK resolves their dependencies.
+* **MP3 Audio:** Automatically converts `.mp3` inputs to 16-bit PCM `.wav` in the build staging directory, then compiles them as `.vsnd_c`. Requires FFmpeg on PATH; source MP3s are preserved.
 * **Direct Resources:** TTF fonts and supported already-compiled resources are copied without compilation. Unsupported files are listed instead of silently omitted.
 * **Safe Output Replacement:** Packing happens in a temporary directory. The previous VPK bundle is backed up before replacement and restored if replacement fails.
 * **Addon Slots:** Uses the first available slot from `pak01` to `pak99`, ignoring stale registry entries. Orphaned numbered data archives also reserve their slot.
@@ -75,10 +76,25 @@ directory for recovery. Replacement is not crash-atomic across split VPK files.
 Texture descriptors are revisited for image changes; the tool does not implement
 a general dependency graph for every Source 2 resource type.
 
+### MP3 sound inputs
+
+Place MP3 files under `sounds`, for example `sounds/mods/alert.mp3`. Install
+FFmpeg and add its `bin` directory to PATH before starting the builder. The tool
+generates `sounds/mods/alert.wav` in its temporary content directory and compiles
+`sounds/mods/alert.vsnd_c`, preserving the original sample rate and channel count.
+Use `sounds/mods/alert.vsnd` in sound event definitions, as with a WAV source.
+Existing `soundevents/*.vsndevts` files compile normally.
+
+Unchanged MP3s reuse their generated WAV and compiled sound; changes, missing
+staging files and `-Force` rebuilds are handled automatically. A missing FFmpeg,
+failed conversion, or MP3/WAV pair with the same path and stem stops the build
+before packing. Keep only one source format per sound.
+
 ### Offline regression checks
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File tools/tests/build_mod_regression.ps1
+powershell -NoProfile -ExecutionPolicy Bypass -File tools/tests/mp3_regression.ps1
 ```
 
 These checks parse the builder and exercise isolated logic with in-memory file
